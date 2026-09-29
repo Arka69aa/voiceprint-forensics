@@ -331,23 +331,32 @@ def verify_speaker(
         savedir=None,
     )
 
-    score, prediction = verifier.verify_files(
+    # Get the raw cosine similarity. Do not use SpeechBrain's built-in
+    # boolean prediction here: its default threshold is 0.25. That default
+    # is too permissive for this app's conservative reference comparison.
+    score, _ = verifier.verify_files(
         ref_path,
         test_path,
     )
 
     score = float(score.squeeze().detach().cpu().item())
-    same = bool(prediction.squeeze().detach().cpu().item())
+
+    # Provisional operating bands; these are NOT probabilities.
+    # >= 0.50: require a stronger similarity before saying "same".
+    # < 0.25: use the library's default boundary as a lower separation band.
+    # 0.25-0.49: overlap/uncertain region -> do not claim same speaker.
+    if score >= 0.50:
+        verdict = "LIKELY SAME SPEAKER"
+    elif score < 0.25:
+        verdict = "LIKELY DIFFERENT SPEAKERS"
+    else:
+        verdict = "INCONCLUSIVE — SCORE IN OVERLAP RANGE"
 
     # Explicitly release the model after the operation.
     del verifier
     gc.collect()
 
-    return score, (
-        "LIKELY SAME SPEAKER"
-        if same
-        else "LIKELY DIFFERENT SPEAKERS"
-    )
+    return score, verdict
 
 
 # -----------------------------
@@ -617,8 +626,10 @@ if reference_file and test_file:
 
                 if speaker_verdict == "LIKELY SAME SPEAKER":
                     st.success(speaker_verdict)
+                elif speaker_verdict == "LIKELY DIFFERENT SPEAKERS":
+                    st.warning(speaker_verdict)
                 else:
-                    st.error(speaker_verdict)
+                    st.info(speaker_verdict)
 
                 st.metric(
                     "ECAPA verification score",
@@ -626,8 +637,9 @@ if reference_file and test_file:
                 )
 
                 st.caption(
-                    "This is a speaker-verification score, not an "
-                    "authenticity percentage."
+                    "Cosine similarity, not an authenticity percentage. "
+                    "Provisional conservative rule: ≥ 0.50 = likely same; "
+                    "< 0.25 = likely different; 0.25–0.49 = inconclusive."
                 )
 
             except Exception as exc:
