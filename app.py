@@ -291,16 +291,13 @@ def run_deepfake_detection(
     median_score = float(np.median(scores))
     max_score = float(np.max(scores))
 
-    # Conservative interpretation:
-    # A low score does NOT mean "proven real".
-    if mean_score >= 0.90:
-        verdict = "STRONG SYNTHETIC EVIDENCE"
-    elif mean_score >= 0.70:
-        verdict = "SYNTHETIC EVIDENCE"
-    elif mean_score >= 0.45:
-        verdict = "INCONCLUSIVE"
+    # The model card documents a 0.5 fake/real decision threshold.
+    # We keep that model threshold intact; we do NOT invent a lower
+    # threshold just to force a positive result.
+    if mean_score >= 0.50:
+        verdict = "MODEL CLASSIFIES AS SYNTHETIC"
     else:
-        verdict = "NO SYNTHETIC EVIDENCE FROM THIS MODEL"
+        verdict = "MODEL CLASSIFIES AS REAL / BELOW FAKE THRESHOLD"
 
     return {
         "status": "ok",
@@ -390,6 +387,29 @@ def acoustic_similarity(
         np.dot(x, y)
         / ((np.linalg.norm(x) * np.linalg.norm(y)) + 1e-12)
     )
+
+
+# -----------------------------
+# Reference-calibrated evidence
+# -----------------------------
+def compare_detector_scores(reference_result, test_result):
+    ref = float(reference_result["mean"])
+    test = float(test_result["mean"])
+    delta = test - ref
+    ratio = test / max(ref, 0.001)
+
+    if test >= 0.50:
+        interpretation = "SYNTHETIC EVIDENCE"
+    elif delta >= 0.10 and test >= 0.10:
+        interpretation = "ELEVATED SYNTHETIC INDICATOR — INCONCLUSIVE"
+    else:
+        interpretation = "NO STRONG SYNTHETIC INDICATOR"
+
+    return {
+        "delta": delta,
+        "ratio": ratio,
+        "interpretation": interpretation,
+    }
 
 
 # -----------------------------
@@ -645,45 +665,54 @@ if reference_file and test_file:
             st.subheader("4. Evidence interpretation")
 
             if test_result is None:
-                st.error(
-                    "INCONCLUSIVE — the synthetic detector did not run."
-                )
-
-            elif (
-                speaker_verdict == "LIKELY SAME SPEAKER"
-                and test_result["mean"] >= 0.70
-            ):
-                st.error(
-                    "SAME-SPEAKER + SYNTHETIC EVIDENCE"
-                )
-                st.write(
-                    "The test recording is consistent with the reference "
-                    "speaker while the specialist detector also reports "
-                    "substantial AI-generated speech evidence."
-                )
-
-            elif test_result["mean"] >= 0.70:
-                st.error(
-                    "SYNTHETIC EVIDENCE DETECTED"
-                )
-
-            elif test_result["mean"] >= 0.45:
-                st.warning(
-                    "INCONCLUSIVE"
-                )
-                st.write(
-                    "The detector did not reach a strong decision. "
-                    "This should not be interpreted as proof of genuine audio."
-                )
-
+                st.error("INCONCLUSIVE — the synthetic detector did not run.")
             else:
-                st.info(
-                    "NO SYNTHETIC EVIDENCE FROM THIS MODEL"
+                relative = compare_detector_scores(
+                    reference_result,
+                    test_result,
                 )
-                st.write(
-                    "The detector currently finds insufficient evidence "
-                    "of AI generation. This does NOT prove the recording "
-                    "is genuine."
+
+                if (
+                    speaker_verdict == "LIKELY SAME SPEAKER"
+                    and relative["interpretation"] == "SYNTHETIC EVIDENCE"
+                ):
+                    st.error("SAME-SPEAKER + SYNTHETIC EVIDENCE")
+                    st.write(
+                        "The test recording is consistent with the reference "
+                        "speaker and the detector crosses its documented "
+                        "fake threshold."
+                    )
+                elif relative["interpretation"] == "SYNTHETIC EVIDENCE":
+                    st.error("SYNTHETIC EVIDENCE DETECTED")
+                elif relative["interpretation"].startswith("ELEVATED"):
+                    st.warning("ELEVATED SYNTHETIC INDICATOR — INCONCLUSIVE")
+                    st.write(
+                        "The test recording receives a substantially higher "
+                        "AI/fake score than the supplied human/reference "
+                        "recording, but the detector does not cross its "
+                        "documented standalone fake threshold. This is an "
+                        "indicator, not proof of synthetic generation."
+                    )
+                else:
+                    st.info("NO STRONG SYNTHETIC INDICATOR")
+                    st.write(
+                        "This model does not provide strong synthetic evidence. "
+                        "That does not prove the recording is human."
+                    )
+
+                st.markdown("### Reference-calibrated detector comparison")
+                c1,c2,c3=st.columns(3)
+                with c1:
+                    st.metric("Reference mean", f"{reference_result['mean']:.1%}")
+                with c2:
+                    st.metric("Test mean", f"{test_result['mean']:.1%}")
+                with c3:
+                    st.metric("Test − reference", f"{relative['delta']:+.1%}")
+
+                st.caption(
+                    "The relative comparison is a diagnostic signal, not a "
+                    "calibrated probability. The detector's published fake "
+                    "threshold remains 0.5."
                 )
 
             st.divider()
