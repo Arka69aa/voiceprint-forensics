@@ -1,7 +1,6 @@
 
 import hashlib
 import io
-import os
 from typing import Dict, List, Tuple
 
 import librosa
@@ -11,13 +10,11 @@ import streamlit as st
 import torch
 import torch.nn.functional as F
 from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
-
 from speechbrain.inference.speaker import SpeakerRecognition
 
 
 # ============================================================
 # VoicePrint Forensics
-# Reference-based speaker verification + synthetic-audio analysis
 # ============================================================
 
 st.set_page_config(
@@ -27,52 +24,25 @@ st.set_page_config(
 )
 
 SAMPLE_RATE = 16000
-CHUNK_SECONDS = 4.0
-CHUNK_SAMPLES = int(SAMPLE_RATE * CHUNK_SECONDS)
+DETECTOR_CHUNK_SECONDS = 4
+DETECTOR_CHUNK_SAMPLES = SAMPLE_RATE * DETECTOR_CHUNK_SECONDS
 
 SPEAKER_MODEL = "speechbrain/spkrec-ecapa-voxceleb"
-DEEPFAKE_MODEL = "MelodyMachine/Deepfake-audio-detection-V2"
+
+# Lightweight Wav2Vec2 detector suitable for Streamlit deployment.
+# The previous 0xmola checkpoint had an invalid/missing model_type.
+DEEPFAKE_MODEL = "mo-thecreator/Deepfake-audio-detection"
 
 
 # -----------------------------
-# Styling
-# -----------------------------
-st.markdown(
-    """
-    <style>
-    .block-container {
-        max-width: 1250px;
-        padding-top: 2rem;
-        padding-bottom: 3rem;
-    }
-    .metric-card {
-        padding: 1rem;
-        border: 1px solid rgba(255,255,255,.10);
-        border-radius: 12px;
-        background: rgba(255,255,255,.035);
-        margin-bottom: .75rem;
-    }
-    .small-muted {
-        color: #9aa7bd;
-        font-size: .9rem;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# -----------------------------
-# Utility functions
+# Audio utilities
 # -----------------------------
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
 def load_audio_bytes(data: bytes) -> Tuple[np.ndarray, int]:
-    """Decode an uploaded audio file to mono 16 kHz float32."""
     audio, sr = sf.read(io.BytesIO(data), always_2d=False)
-
     audio = np.asarray(audio)
 
     if audio.ndim == 2:
@@ -80,8 +50,6 @@ def load_audio_bytes(data: bytes) -> Tuple[np.ndarray, int]:
 
     audio = audio.astype(np.float32)
 
-    # soundfile normally gives normalized floating point for common formats.
-    # Protect against unusual integer-like ranges.
     peak = np.max(np.abs(audio)) if audio.size else 0.0
     if peak > 1.5:
         audio = audio / peak
@@ -96,18 +64,20 @@ def load_audio_bytes(data: bytes) -> Tuple[np.ndarray, int]:
     audio = np.asarray(audio, dtype=np.float32)
 
     if audio.size == 0:
-        raise ValueError("The uploaded file contains no decodable audio.")
+        raise ValueError("No decodable audio was found.")
 
     return audio, SAMPLE_RATE
 
 
 def audio_stats(audio: np.ndarray, sr: int) -> Dict[str, float]:
     duration = len(audio) / sr
-    peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
-    rms = float(np.sqrt(np.mean(np.square(audio)) + 1e-12))
+    peak = float(np.max(np.abs(audio)))
+    rms = float(np.sqrt(np.mean(audio**2) + 1e-12))
 
     zcr = float(np.mean(librosa.feature.zero_crossing_rate(audio)[0]))
-    centroid = float(np.mean(librosa.feature.spectral_centroid(y=audio, sr=sr)[0]))
+    centroid = float(
+        np.mean(librosa.feature.spectral_centroid(y=audio, sr=sr)[0])
+    )
     rolloff = float(
         np.mean(
             librosa.feature.spectral_rolloff(
@@ -119,15 +89,14 @@ def audio_stats(audio: np.ndarray, sr: int) -> Dict[str, float]:
     )
 
     frame_rms = librosa.feature.rms(y=audio)[0]
-    rms_std = float(np.std(frame_rms))
-
-    silence_ratio = float(np.mean(frame_rms < max(1e-5, rms * 0.12)))
+    silence_ratio = float(
+        np.mean(frame_rms < max(1e-5, rms * 0.12))
+    )
 
     return {
         "duration": duration,
         "peak": peak,
         "rms": rms,
-        "rms_std": rms_std,
         "zcr": zcr,
         "spectral_centroid": centroid,
         "spectral_rolloff": rolloff,
@@ -135,13 +104,8 @@ def audio_stats(audio: np.ndarray, sr: int) -> Dict[str, float]:
     }
 
 
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
-    return float(np.dot(a, b) / denom)
-
-
 def acoustic_vector(audio: np.ndarray, sr: int) -> np.ndarray:
-    """Diagnostic acoustic representation. This is NOT a speaker embedding."""
+    """Diagnostic only; this is not a speaker/authenticity embedding."""
     mfcc = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=20)
     contrast = librosa.feature.spectral_contrast(y=audio, sr=sr)
     chroma = librosa.feature.chroma_stft(y=audio, sr=sr)
@@ -149,64 +113,74 @@ def acoustic_vector(audio: np.ndarray, sr: int) -> np.ndarray:
     rms = librosa.feature.rms(y=audio)
     rolloff = librosa.feature.spectral_rolloff(y=audio, sr=sr)
 
-    parts = []
+    features = []
     for x in [mfcc, contrast, chroma, zcr, rms, rolloff]:
-        parts.extend(np.mean(x, axis=1).tolist())
-        parts.extend(np.std(x, axis=1).tolist())
+        features.extend(np.mean(x, axis=1).tolist())
+        features.extend(np.std(x, axis=1).tolist())
 
-    return np.asarray(parts, dtype=np.float32)
+    return np.asarray(features, dtype=np.float32)
 
 
-def prepare_4s(audio: np.ndarray) -> np.ndarray:
-    """Pad/truncate to the 4-second input length used by the detector."""
-    if len(audio) >= CHUNK_SAMPLES:
-        return audio[:CHUNK_SAMPLES].astype(np.float32)
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    return float(
+        np.dot(a, b)
+        / ((np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12)
+    )
+
+
+def prepare_4_seconds(audio: np.ndarray) -> np.ndarray:
+    if len(audio) >= DETECTOR_CHUNK_SAMPLES:
+        return audio[:DETECTOR_CHUNK_SAMPLES].astype(np.float32)
 
     return np.pad(
         audio,
-        (0, CHUNK_SAMPLES - len(audio)),
+        (0, DETECTOR_CHUNK_SAMPLES - len(audio)),
         mode="constant",
     ).astype(np.float32)
 
 
 def make_chunks(audio: np.ndarray) -> List[np.ndarray]:
-    """Create non-overlapping 4-second chunks, padding the final chunk."""
-    if len(audio) <= CHUNK_SAMPLES:
-        return [prepare_4s(audio)]
+    """
+    The detector is documented for fixed-length speech segments.
+    We use non-overlapping 4-second windows and pad the final window.
+    """
+    if len(audio) <= DETECTOR_CHUNK_SAMPLES:
+        return [prepare_4_seconds(audio)]
 
     chunks = []
-    for start in range(0, len(audio), CHUNK_SAMPLES):
-        chunk = audio[start:start + CHUNK_SAMPLES]
-        if len(chunk) < CHUNK_SAMPLES:
-            chunk = prepare_4s(chunk)
-        chunks.append(chunk)
+
+    for start in range(0, len(audio), DETECTOR_CHUNK_SAMPLES):
+        chunk = audio[start:start + DETECTOR_CHUNK_SAMPLES]
+        chunks.append(prepare_4_seconds(chunk))
 
     return chunks
 
 
 # -----------------------------
-# Model loading
+# Models
 # -----------------------------
-@st.cache_resource(show_spinner="Loading ECAPA-TDNN speaker model...")
+@st.cache_resource(show_spinner="Loading ECAPA speaker model...")
 def load_speaker_model():
-    # savedir=None avoids the Windows symlink problem encountered during local use.
     return SpeakerRecognition.from_hparams(
         source=SPEAKER_MODEL,
         savedir=None,
     )
 
 
-@st.cache_resource(show_spinner="Loading deepfake detection model...")
+@st.cache_resource(show_spinner="Loading synthetic-audio detector...")
 def load_deepfake_model():
-    """
-    MelodyMachine's checkpoint has a normal Wav2Vec2 config with
-    model_type='wav2vec2', so it can be loaded directly through
-    Transformers instead of the broken 0xmola pipeline configuration.
-    """
-    extractor = AutoFeatureExtractor.from_pretrained(DEEPFAKE_MODEL)
-    model = AutoModelForAudioClassification.from_pretrained(DEEPFAKE_MODEL)
+    extractor = AutoFeatureExtractor.from_pretrained(
+        DEEPFAKE_MODEL
+    )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = AutoModelForAudioClassification.from_pretrained(
+        DEEPFAKE_MODEL
+    )
+
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+
     model.to(device)
     model.eval()
 
@@ -218,70 +192,82 @@ def load_deepfake_model():
 # -----------------------------
 def verify_speaker(
     speaker_model,
-    ref_bytes: bytes,
+    reference_bytes: bytes,
     test_bytes: bytes,
-) -> Tuple[float, str]:
-    """
-    ECAPA speaker verification.
+):
+    ref_audio, _ = load_audio_bytes(reference_bytes)
+    test_audio, _ = load_audio_bytes(test_bytes)
 
-    SpeechBrain's verify_batch returns a verification score and a
-    thresholded prediction. We expose the score only as a speaker
-    similarity/verification signal, not as an authenticity percentage.
-    """
     ref_path = "/tmp/vpf_reference.wav"
     test_path = "/tmp/vpf_test.wav"
-
-    ref_audio, _ = load_audio_bytes(ref_bytes)
-    test_audio, _ = load_audio_bytes(test_bytes)
 
     sf.write(ref_path, ref_audio, SAMPLE_RATE)
     sf.write(test_path, test_audio, SAMPLE_RATE)
 
-    score, prediction = speaker_model.verify_files(ref_path, test_path)
+    score, prediction = speaker_model.verify_files(
+        ref_path,
+        test_path,
+    )
 
-    score_value = float(score.squeeze().detach().cpu().item())
-    same_speaker = bool(prediction.squeeze().detach().cpu().item())
+    score = float(score.squeeze().detach().cpu().item())
+    same = bool(prediction.squeeze().detach().cpu().item())
 
     verdict = (
         "LIKELY SAME SPEAKER"
-        if same_speaker
+        if same
         else "LIKELY DIFFERENT SPEAKERS"
     )
 
-    return score_value, verdict
+    return score, verdict
 
 
 # -----------------------------
-# Deepfake detection
+# Deepfake detector
 # -----------------------------
-def find_label_index(model, wanted: str):
-    wanted = wanted.lower()
-
+def resolve_fake_index(model):
+    """
+    Read the model's own label configuration rather than assuming
+    LABEL_0/LABEL_1 ordering.
+    """
     label2id = getattr(model.config, "label2id", {}) or {}
-
-    for label, idx in label2id.items():
-        if str(label).lower() == wanted:
-            return int(idx)
-
     id2label = getattr(model.config, "id2label", {}) or {}
 
-    for idx, label in id2label.items():
-        if str(label).lower() == wanted:
+    for label, idx in label2id.items():
+        text = str(label).lower()
+        if any(
+            word in text
+            for word in ["fake", "spoof", "synthetic", "deepfake"]
+        ):
             return int(idx)
 
-    return None
+    for idx, label in id2label.items():
+        text = str(label).lower()
+        if any(
+            word in text
+            for word in ["fake", "spoof", "synthetic", "deepfake"]
+        ):
+            return int(idx)
+
+    # Fallback for the common binary fine-tuned Wav2Vec2 convention.
+    if len(id2label) == 2:
+        return 1
+
+    raise RuntimeError(
+        "Could not identify the detector's fake/spoof class. "
+        f"Model labels: {id2label}"
+    )
 
 
-def deepfake_chunk_score(
-    audio_chunk: np.ndarray,
+def detector_chunk(
+    audio: np.ndarray,
     extractor,
     model,
     device,
-) -> Dict[str, float]:
-    audio_chunk = prepare_4s(audio_chunk)
+):
+    audio = prepare_4_seconds(audio)
 
     inputs = extractor(
-        audio_chunk,
+        audio,
         sampling_rate=SAMPLE_RATE,
         return_tensors="pt",
         padding=True,
@@ -294,36 +280,14 @@ def deepfake_chunk_score(
 
     with torch.inference_mode():
         logits = model(**inputs).logits
-        probs = F.softmax(logits, dim=-1)[0]
+        probabilities = F.softmax(logits, dim=-1)[0]
 
-    spoof_idx = find_label_index(model, "fake")
-
-    if spoof_idx is None:
-        spoof_idx = find_label_index(model, "spoof")
-
-    real_idx = find_label_index(model, "real")
-
-    if real_idx is None:
-        real_idx = find_label_index(model, "bonafide")
-
-    if spoof_idx is None:
-        raise RuntimeError(
-            f"Could not identify the fake/spoof label. "
-            f"Model labels: {getattr(model.config, 'id2label', {})}"
-        )
-
-    fake_probability = float(probs[spoof_idx].item())
-
-    real_probability = (
-        float(probs[real_idx].item())
-        if real_idx is not None
-        else float(1.0 - fake_probability)
+    fake_index = resolve_fake_index(model)
+    fake_probability = float(
+        probabilities[fake_index].detach().cpu().item()
     )
 
-    return {
-        "fake_probability": fake_probability,
-        "real_probability": real_probability,
-    }
+    return fake_probability
 
 
 def analyze_deepfake(
@@ -331,24 +295,24 @@ def analyze_deepfake(
     extractor,
     model,
     device,
-) -> Dict[str, object]:
+):
     chunks = make_chunks(audio)
-
     scores = []
 
     progress = st.progress(
         0,
-        text="Analyzing audio for synthetic/spoof evidence...",
+        text="Analyzing synthetic/spoof evidence...",
     )
 
     for i, chunk in enumerate(chunks):
-        result = deepfake_chunk_score(
-            chunk,
-            extractor,
-            model,
-            device,
+        scores.append(
+            detector_chunk(
+                chunk,
+                extractor,
+                model,
+                device,
+            )
         )
-        scores.append(result)
 
         progress.progress(
             (i + 1) / len(chunks),
@@ -357,16 +321,11 @@ def analyze_deepfake(
 
     progress.empty()
 
-    fake_probs = np.asarray(
-        [x["fake_probability"] for x in scores],
-        dtype=np.float32,
-    )
+    scores = np.asarray(scores, dtype=np.float32)
 
-    # We intentionally report the mean model output rather than inventing
-    # a calibrated "authenticity percentage".
-    mean_fake = float(np.mean(fake_probs))
-    max_fake = float(np.max(fake_probs))
-    median_fake = float(np.median(fake_probs))
+    mean_fake = float(np.mean(scores))
+    median_fake = float(np.median(scores))
+    max_fake = float(np.max(scores))
 
     if mean_fake >= 0.80:
         verdict = "HIGH SYNTHETIC / SPOOF EVIDENCE"
@@ -378,12 +337,12 @@ def analyze_deepfake(
         verdict = "INCONCLUSIVE"
 
     return {
-        "mean_fake_probability": mean_fake,
-        "median_fake_probability": median_fake,
-        "max_fake_probability": max_fake,
-        "chunk_scores": fake_probs,
+        "mean": mean_fake,
+        "median": median_fake,
+        "maximum": max_fake,
+        "scores": scores,
         "verdict": verdict,
-        "chunk_count": len(chunks),
+        "chunks": len(chunks),
     }
 
 
@@ -396,31 +355,30 @@ st.caption(
 )
 
 st.warning(
-    "This tool provides forensic indicators, not courtroom-grade "
-    "authentication. Speaker similarity does not prove that an audio "
-    "recording is genuine, and synthetic-audio detectors can produce "
-    "false positives and false negatives."
+    "This is an assistive forensic tool, not a courtroom-grade "
+    "authentication system. A speaker match does not prove that a "
+    "recording is genuine. Detector results can be wrong, especially "
+    "for generators or recording conditions not represented in training."
 )
 
-with st.expander("How the analysis works", expanded=False):
+with st.expander("How this version works"):
     st.markdown(
         """
-        **1. Speaker verification**
+        **Speaker verification**
 
-        ECAPA-TDNN compares the reference and test recordings for speaker
-        characteristics. This answers **whether the recordings are likely
-        from the same speaker**.
+        ECAPA-TDNN independently estimates whether the reference and
+        test recordings are likely to belong to the same speaker.
 
-        **2. Synthetic/spoof analysis**
+        **Synthetic-audio detection**
 
-        A Wav2Vec2-based classifier analyzes 4-second audio windows and
-        estimates whether each window resembles the **fake** or **real**
-        classes it was trained on.
+        A Wav2Vec2 classifier analyzes 4-second windows and estimates
+        whether they resemble its learned fake/spoof class.
 
-        **3. Acoustic diagnostics**
+        **Acoustic diagnostics**
 
-        Basic signal statistics are shown separately. They are supporting
-        diagnostics and are not treated as proof of identity or authenticity.
+        Spectral/MFCC statistics are displayed separately. They are
+        diagnostic measurements and are deliberately NOT used as an
+        authenticity percentage.
         """
     )
 
@@ -428,7 +386,7 @@ col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("Reference recording")
-    ref_file = st.file_uploader(
+    reference_file = st.file_uploader(
         "Upload the known/reference voice",
         type=["wav", "mp3", "flac", "m4a", "ogg", "aac"],
         key="reference",
@@ -442,71 +400,89 @@ with col2:
         key="test",
     )
 
-if ref_file is not None and test_file is not None:
-    ref_bytes = ref_file.getvalue()
+
+if reference_file and test_file:
+
+    reference_bytes = reference_file.getvalue()
     test_bytes = test_file.getvalue()
 
-    ref_hash = sha256_bytes(ref_bytes)
+    reference_hash = sha256_bytes(reference_bytes)
     test_hash = sha256_bytes(test_bytes)
 
     st.divider()
-
     st.subheader("File information")
 
     info1, info2 = st.columns(2)
 
     with info1:
         st.markdown("### Reference")
-        st.write(f"**File:** {ref_file.name}")
-        st.write(f"**SHA-256:** `{ref_hash}`")
+        st.write(f"File: **{reference_file.name}**")
+        st.write(f"SHA-256: `{reference_hash}`")
 
     with info2:
         st.markdown("### Test")
-        st.write(f"**File:** {test_file.name}")
-        st.write(f"**SHA-256:** `{test_hash}`")
+        st.write(f"File: **{test_file.name}**")
+        st.write(f"SHA-256: `{test_hash}`")
 
-    if ref_hash == test_hash:
+    if reference_hash == test_hash:
         st.info(
-            "The two uploaded files are byte-for-byte identical. "
-            "This is a file identity result, not a speaker/authenticity result."
+            "The files are byte-for-byte identical."
         )
 
     try:
-        ref_audio, ref_sr = load_audio_bytes(ref_bytes)
-        test_audio, test_sr = load_audio_bytes(test_bytes)
+        reference_audio, reference_sr = load_audio_bytes(
+            reference_bytes
+        )
+        test_audio, test_sr = load_audio_bytes(
+            test_bytes
+        )
 
-        ref_stats = audio_stats(ref_audio, ref_sr)
-        test_stats = audio_stats(test_audio, test_sr)
+        reference_stats = audio_stats(
+            reference_audio,
+            reference_sr,
+        )
+        test_stats = audio_stats(
+            test_audio,
+            test_sr,
+        )
 
         st.subheader("Audio diagnostics")
 
-        diag1, diag2 = st.columns(2)
+        d1, d2 = st.columns(2)
 
-        with diag1:
+        with d1:
             st.markdown("### Reference")
-            st.write(f"Duration: **{ref_stats['duration']:.2f} s**")
-            st.write(f"RMS: **{ref_stats['rms']:.5f}**")
-            st.write(f"Peak: **{ref_stats['peak']:.5f}**")
             st.write(
-                f"Spectral centroid: **{ref_stats['spectral_centroid']:.1f} Hz**"
+                f"Duration: **{reference_stats['duration']:.2f} s**"
             )
             st.write(
-                f"Spectral rolloff: **{ref_stats['spectral_rolloff']:.1f} Hz**"
+                f"RMS: **{reference_stats['rms']:.5f}**"
             )
-            st.write(f"Silence ratio: **{ref_stats['silence_ratio']:.1%}**")
+            st.write(
+                f"Spectral centroid: "
+                f"**{reference_stats['spectral_centroid']:.1f} Hz**"
+            )
+            st.write(
+                f"Silence ratio: "
+                f"**{reference_stats['silence_ratio']:.1%}**"
+            )
 
-        with diag2:
+        with d2:
             st.markdown("### Test")
-            st.write(f"Duration: **{test_stats['duration']:.2f} s**")
-            st.write(f"RMS: **{test_stats['rms']:.5f}**")
-            st.write(f"Peak: **{test_stats['peak']:.5f}**")
             st.write(
-                f"Spectral centroid: **{test_stats['spectral_centroid']:.1f} Hz**"
+                f"Duration: **{test_stats['duration']:.2f} s**"
             )
             st.write(
-                f"Spectral rolloff: **{test_stats['spectral_rolloff']:.1f} Hz**"
+                f"RMS: **{test_stats['rms']:.5f}**"
             )
-            st.write(f"Silence ratio: **{test_stats['silence_ratio']:.1%}**")
+            st.write(
+                f"Spectral centroid: "
+                f"**{test_stats['spectral_centroid']:.1f} Hz**"
+            )
+            st.write(
+                f"Silence ratio: "
+                f"**{test_stats['silence_ratio']:.1%}**"
+            )
 
         st.divider()
 
@@ -515,20 +491,25 @@ if ref_file is not None and test_file is not None:
             type="primary",
             use_container_width=True,
         ):
+
             try:
                 with st.spinner("Loading forensic models..."):
                     speaker_model = load_speaker_model()
-                    extractor, deepfake_model, device = load_deepfake_model()
+                    extractor, deepfake_model, detector_device = (
+                        load_deepfake_model()
+                    )
 
                 # -------------------------
-                # Speaker verification
+                # Speaker
                 # -------------------------
                 st.subheader("1. Speaker verification")
 
-                with st.spinner("Comparing speaker characteristics..."):
+                with st.spinner(
+                    "Comparing speaker characteristics..."
+                ):
                     speaker_score, speaker_verdict = verify_speaker(
                         speaker_model,
-                        ref_bytes,
+                        reference_bytes,
                         test_bytes,
                     )
 
@@ -543,106 +524,139 @@ if ref_file is not None and test_file is not None:
                 )
 
                 st.caption(
-                    "This score is a speaker-verification signal. "
-                    "It is not a percentage of authenticity."
+                    "Speaker-verification score only; it is NOT "
+                    "an authenticity percentage."
                 )
 
                 # -------------------------
-                # Deepfake analysis
+                # Synthetic audio
                 # -------------------------
                 st.subheader("2. Synthetic / spoof evidence")
 
-                with st.spinner("Running chunk-level synthetic-audio analysis..."):
-                    ref_fake = analyze_deepfake(
-                        ref_audio,
-                        extractor,
-                        deepfake_model,
-                        device,
-                    )
+                reference_result = analyze_deepfake(
+                    reference_audio,
+                    extractor,
+                    deepfake_model,
+                    detector_device,
+                )
 
-                    test_fake = analyze_deepfake(
-                        test_audio,
-                        extractor,
-                        deepfake_model,
-                        device,
-                    )
+                test_result = analyze_deepfake(
+                    test_audio,
+                    extractor,
+                    deepfake_model,
+                    detector_device,
+                )
 
-                d1, d2 = st.columns(2)
+                s1, s2 = st.columns(2)
 
-                with d1:
+                with s1:
                     st.markdown("### Reference")
                     st.metric(
                         "Mean fake probability",
-                        f"{ref_fake['mean_fake_probability']:.1%}",
+                        f"{reference_result['mean']:.1%}",
                     )
                     st.write(
-                        f"Median: **{ref_fake['median_fake_probability']:.1%}**"
+                        f"Median: **{reference_result['median']:.1%}**"
                     )
                     st.write(
-                        f"Maximum chunk: **{ref_fake['max_fake_probability']:.1%}**"
+                        f"Maximum chunk: "
+                        f"**{reference_result['maximum']:.1%}**"
                     )
-                    st.write(f"Verdict: **{ref_fake['verdict']}**")
+                    st.write(
+                        f"Verdict: **{reference_result['verdict']}**"
+                    )
 
-                with d2:
+                with s2:
                     st.markdown("### Test")
                     st.metric(
                         "Mean fake probability",
-                        f"{test_fake['mean_fake_probability']:.1%}",
+                        f"{test_result['mean']:.1%}",
                     )
                     st.write(
-                        f"Median: **{test_fake['median_fake_probability']:.1%}**"
+                        f"Median: **{test_result['median']:.1%}**"
                     )
                     st.write(
-                        f"Maximum chunk: **{test_fake['max_fake_probability']:.1%}**"
+                        f"Maximum chunk: "
+                        f"**{test_result['maximum']:.1%}**"
                     )
-                    st.write(f"Verdict: **{test_fake['verdict']}**")
+                    st.write(
+                        f"Verdict: **{test_result['verdict']}**"
+                    )
 
                 st.caption(
-                    "The detector was trained around ASVspoof-style spoofing "
-                    "data. Performance can change substantially on codecs, "
-                    "re-recordings, languages, microphones, noise, and "
-                    "generative systems not represented in training data."
+                    "The detector is a learned classifier, not a universal "
+                    "AI-voice detector. Its validation performance does "
+                    "not guarantee performance on every voice generator."
                 )
 
                 # -------------------------
-                # Acoustic comparison
+                # Acoustic diagnostic
                 # -------------------------
                 st.subheader("3. Acoustic diagnostics")
 
-                ref_vec = acoustic_vector(ref_audio, ref_sr)
-                test_vec = acoustic_vector(test_audio, test_sr)
+                ref_vector = acoustic_vector(
+                    reference_audio,
+                    reference_sr,
+                )
+                test_vector = acoustic_vector(
+                    test_audio,
+                    test_sr,
+                )
 
-                acoustic_sim = cosine_similarity(ref_vec, test_vec)
+                acoustic_similarity = cosine_similarity(
+                    ref_vector,
+                    test_vector,
+                )
 
                 st.metric(
                     "Diagnostic acoustic-vector similarity",
-                    f"{acoustic_sim:.4f}",
+                    f"{acoustic_similarity:.4f}",
                 )
 
                 st.caption(
-                    "This is only a broad acoustic diagnostic. Do not use it "
-                    "as a speaker identity or authenticity score."
+                    "Diagnostic only. High acoustic similarity is not "
+                    "evidence that a recording is human or authentic."
                 )
 
                 # -------------------------
-                # Final evidence summary
+                # Summary
                 # -------------------------
                 st.subheader("Forensic evidence summary")
 
-                summary = [
-                    ("Speaker verification", speaker_verdict),
-                    ("Reference synthetic evidence", ref_fake["verdict"]),
-                    ("Test synthetic evidence", test_fake["verdict"]),
-                ]
-
-                for name, value in summary:
-                    st.write(f"**{name}:** {value}")
-
-                st.info(
-                    "Interpret the three outputs independently. A recording "
-                    "can be from the same speaker and still be synthetic, "
-                    "edited, replayed, or otherwise manipulated."
+                st.write(
+                    f"**Speaker:** {speaker_verdict}"
                 )
+                st.write(
+                    f"**Reference synthetic evidence:** "
+                    f"{reference_result['verdict']}"
+                )
+                st.write(
+                    f"**Test synthetic evidence:** "
+                    f"{test_result['verdict']}"
+                )
+
+                if (
+                    speaker_verdict == "LIKELY SAME SPEAKER"
+                    and test_result["mean"] >= 0.55
+                ):
+                    st.warning(
+                        "The test recording is consistent with the "
+                        "reference speaker while also showing synthetic/"
+                        "spoof evidence. This combination can occur with "
+                        "AI voice cloning, but the detector result alone "
+                        "does not establish how the audio was produced."
+                    )
+                elif test_result["mean"] <= 0.20:
+                    st.info(
+                        "The current detector found low synthetic evidence. "
+                        "This does NOT prove that the recording is genuine."
+                    )
+                else:
+                    st.info(
+                        "The synthetic-audio evidence is inconclusive. "
+                        "Use the individual model outputs rather than "
+                        "treating them as a single authenticity score."
+                    )
 
             except Exception as exc:
                 st.error("Analysis failed.")
@@ -657,6 +671,7 @@ else:
     )
 
 st.divider()
+
 st.caption(
     "VoicePrint Forensics • ECAPA-TDNN speaker verification + "
     "Wav2Vec2 synthetic-audio analysis"
