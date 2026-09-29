@@ -10,7 +10,7 @@ import soundfile as sf
 import streamlit as st
 import torch
 import torch.nn.functional as F
-from transformers import AutoProcessor, AutoModelForAudioClassification
+from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
 from speechbrain.inference.speaker import SpeakerRecognition
 
 
@@ -173,7 +173,12 @@ def make_detector_windows(audio: np.ndarray) -> List[np.ndarray]:
 # Specialist detector
 # -----------------------------
 def load_deepfake_detector():
-    processor = AutoProcessor.from_pretrained(
+    # IMPORTANT:
+    # This repository contains preprocessor_config.json but no tokenizer.
+    # AutoProcessor tries to construct a Wav2Vec2CTCTokenizer and therefore
+    # fails. This is audio classification, so we only need the feature
+    # extractor.
+    feature_extractor = AutoFeatureExtractor.from_pretrained(
         DEEPFAKE_MODEL
     )
 
@@ -184,7 +189,7 @@ def load_deepfake_detector():
 
     model.eval()
 
-    return processor, model
+    return feature_extractor, model
 
 
 def fake_index(model) -> int:
@@ -212,7 +217,7 @@ def fake_index(model) -> int:
 
 def detector_score(
     audio: np.ndarray,
-    processor,
+    feature_extractor,
     model,
 ) -> float:
     # Normalize per clip as recommended for robustness.
@@ -223,7 +228,7 @@ def detector_score(
     if std > 1e-7:
         audio = audio / std
 
-    inputs = processor(
+    inputs = feature_extractor(
         audio,
         sampling_rate=SR,
         return_tensors="pt",
@@ -241,7 +246,7 @@ def detector_score(
 
 def run_deepfake_detection(
     audio: np.ndarray,
-    processor,
+    feature_extractor,
     model,
 ) -> Dict[str, object]:
 
@@ -268,7 +273,7 @@ def run_deepfake_detection(
         scores.append(
             detector_score(
                 window,
-                processor,
+                feature_extractor,
                 model,
             )
         )
@@ -509,22 +514,22 @@ if reference_file and test_file:
             st.subheader("1. Synthetic / AI-voice detection")
 
             try:
-                processor, deepfake_model = load_deepfake_detector()
+                feature_extractor, deepfake_model = load_deepfake_detector()
 
                 reference_result = run_deepfake_detection(
                     reference_audio,
-                    processor,
+                    feature_extractor,
                     deepfake_model,
                 )
 
                 test_result = run_deepfake_detection(
                     test_audio,
-                    processor,
+                    feature_extractor,
                     deepfake_model,
                 )
 
                 # Release the large Wav2Vec2 model BEFORE loading ECAPA.
-                del processor
+                del feature_extractor
                 del deepfake_model
                 gc.collect()
 
