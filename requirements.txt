@@ -2,8 +2,8 @@ streamlit
 numpy
 librosa
 soundfile
-torch
-torchaudio
+torch==2.5.1
+torchaudio==2.5.1
 transformers==4.41.2
-speechbrain
+speechbrain==1.0.3
 huggingface_hub
