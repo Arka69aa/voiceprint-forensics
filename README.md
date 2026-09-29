@@ -1,40 +1,19 @@
-# 🔍 VoicePrint Forensics
+# 🎙️ VoicePrint Forensics
 
-Reference-based speaker verification and synthetic-audio analysis built with Streamlit.
+[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://voiceprint-forensics-8bappznl9vpe4bb5esyn7m5.streamlit.app/)
+
+Reference-based speaker verification and synthetic-audio analysis.
 
 ## Features
 
-- ECAPA-TDNN speaker verification
-- WavLM-based synthetic/spoof audio analysis
-- Acoustic diagnostics
-- Audio quality checks
-- Separate speaker similarity and synthetic-evidence results
+- 🎙️ ECAPA-TDNN speaker verification
+- 🤖 Synthetic/spoof audio detection
+- 🔊 Acoustic diagnostics
+- 🔐 SHA-256 file identification
+- 📊 Chunk-level audio analysis
 
 ## Important
 
-This is an experimental forensic analysis tool. A high speaker similarity does **not** prove that a recording is authentic, and synthetic-audio detectors can produce false positives and false negatives.
-
-## Run locally
-
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-## Deploy
-
-This repository is structured for Streamlit Community Cloud.
-
-## Recommended audio
-
-- 4+ seconds of clear speech
-- Minimal background noise/music
-- WAV preferred when available
-- Avoid extremely compressed recordings
-
-## Models
-
-- `speechbrain/spkrec-ecapa-voxceleb`
-- `0xmola/wavlm-deepfake-audio-forensics`
-
-For educational and research use.
+This tool provides forensic indicators, not courtroom-grade authentication.
+Speaker similarity does not prove that an audio recording is genuine.
+Synthetic-audio detectors can produce false positives and false negatives.
