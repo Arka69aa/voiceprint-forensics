@@ -1,0 +1,9 @@
+streamlit
+numpy
+librosa
+soundfile
+torch
+torchaudio
+transformers
+speechbrain
+huggingface_hub
